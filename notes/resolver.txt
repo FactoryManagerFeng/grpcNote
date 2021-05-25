@@ -1,0 +1,107 @@
+目的
+    grpc的resolver是如何工作的
+
+工作原理
+    我们使用grpc的时候，需要用Dail函数创建一个clientConn对象，resolver是这个对象中的一员
+    1. Dail创建clientConn的时候需要传入参数target,target就是需要连接的server
+    cc := &ClientConn{
+        target:            target,
+        csMgr:             &connectivityStateManager{},
+        conns:             make(map[*addrConn]struct{}),
+        dopts:             defaultDialOptions(),
+        blockingpicker:    newPickerWrapper(),
+        czData:            new(channelzData),  //用于存储链接的一些信息
+        firstResolveEvent: grpcsync.NewEvent(),
+    }
+
+    2. 接下来,对这个target进行了解析
+    cc.parsedTarget = parseTarget(cc.target)
+
+    3. parseTarget中对target进行了拆分，://前面是scheme,也就是解析方案，后面又可以分为Authority，Endpoint，Endpoint是server的一个标识
+    Authority据官方解释是DNS服务器
+
+    4. 解析出来的scheme用来对应的resolver builder
+    cc.dopts.resolverBuilder = resolver.Get(cc.parsedTarget.Scheme)
+
+    5. resolver会注册在一个全局的map中，Get方法能通过名字找到对应的Builder
+    func Get(scheme string) Builder {
+    	if b, ok := m[scheme]; ok {
+    		return b
+    	}
+    	return nil
+    }
+
+    6. resolver会在初始化的时候，注册到m全局map中
+    func Register(b Builder) {
+    	m[b.Scheme()] = b
+    }
+    func init() {
+    	resolver.Register(&passthroughBuilder{})
+    }
+
+    7. grpc通过提供注册的方式，可以实现不同形式的解析规则
+
+    8. 如果没找到对应的builder,会使用默认的resolver解析，默认是 passthrough
+    cc.parsedTarget = resolver.Target{
+        // 走passthrough解析器规则
+        Scheme:   resolver.GetDefaultScheme(),
+        Endpoint: target,
+    }
+
+    9. DialContext会使用resolverBuilder构建一个resolver,并将其赋值给clientConn对象
+    rb := cc.dopts.resolverBuilder
+    if rb == nil {
+        return nil, fmt.Errorf("could not get resolver for scheme: %q", cc.parsedTarget.Scheme)
+    }
+
+    ccr := &ccResolverWrapper{
+        cc:     cc,
+        addrCh: make(chan []resolver.Address, 1),
+        scCh:   make(chan string, 1),
+        done:   make(chan struct{}),
+    }
+
+    var err error
+    // 调用build 其中调用了NewAddress这个方法
+    ccr.resolver, err = rb.Build(cc.parsedTarget, ccr, resolver.BuildOption{DisableServiceConfig: cc.dopts.disableServiceConfig})
+    if err != nil {
+        return nil, err
+    }
+
+    10. 调用了target解析出来Builder中的Build方法
+
+    11. resolver中Build方法里做什么，需要我们自己实现，具体实现我们以后再讨论
+
+    12. 上面构建了cc，接下来我们看调用逻辑
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    cc, err := pool.getClientConn()
+    if err != nil {
+        return err
+    }
+    return cc.Invoke(ctx, method, in, out)
+
+    13. 所有的请求都是通过Invoke发出的
+    // 合并两个参数
+    opts = combine(cc.dopts.callOptions, opts)
+
+    // 拦截器是否为空，不为空走拦截器方法 拦截器中会加入自己的流程，其实最后还是调用invoke方法
+    if cc.dopts.unaryInt != nil {
+        return cc.dopts.unaryInt(ctx, method, args, reply, cc, invoke, opts...)
+    }
+    return invoke(ctx, method, args, reply, cc, opts...)
+
+    14. 判断是否添加了拦截器，如果存在拦截器，走拦截器，不存在拦截器直接invoke
+    cs, err := newClientStream(ctx, unaryStreamDesc, cc, method, opts...)
+    if err != nil {
+        return err
+    }
+    if err := cs.SendMsg(req); err != nil {
+        return err
+    }
+    return cs.RecvMsg(reply)
+
+    15. invoke中处理流程如下
+    newClientStream->newAttemptLocked->getTransport->pick(最终调用负载均衡策略中的pick)->getReadyTransport->connect
+    ->resetTransport->循环尝试所有addr(新版本tryAllAddrs)->createTransport->NewClientTransport->newHTTP2Client
+    这是整个invoke调用流程，其中在pick的时候调用了具体balance中的pick，获取对应的subConn,根据对应的subConn去
